@@ -1,7 +1,7 @@
 """CSEM数据处理系统 - 主程序入口"""
 
 import sys
-from typing import Optional
+from typing import Optional, Dict, List
 
 import numpy as np
 
@@ -13,8 +13,9 @@ from gui.main_window import MainWindow
 from core.data_reader import DataReader
 from core.preprocessing import Preprocessor
 from core.spectrum import SpectrumAnalyzer
-from core.impedance import ImpedanceCalculator
+from core.impedance import ImpedanceCalculator, ImpedanceResult
 from core.resistivity import compute_apparent_resistivity
+from core.emission_extractor import EmissionExtractor
 
 
 class CSEMApplication:
@@ -29,6 +30,11 @@ class CSEMApplication:
         self._processed_data: Optional[np.ndarray] = None
         self._channel_names: list = []
         self._sample_rate: float = 200.0
+        
+        self._freqs: Optional[np.ndarray] = None
+        self._psd: Optional[np.ndarray] = None
+        self._impedance_results: Dict[float, ImpedanceResult] = {}
+        self._apparent_resistivity: Optional[np.ndarray] = None
         
         self._connect_signals()
     
@@ -133,7 +139,8 @@ class CSEMApplication:
         params = self.window.control_panel.get_params()
         fs = params['sample_rate']
         
-        self.window.set_status('开始处理...')
+        self.window.set_status('步骤1/7: 预处理...')
+        self.window.set_step(1, 7)
         
         preprocessor = Preprocessor(fs)
         self._processed_data = preprocessor.process(
@@ -149,15 +156,82 @@ class CSEMApplication:
         
         self.window.time_series_widget.set_data(self._times, self._processed_data, self._channel_names)
         
+        self.window.set_status('步骤2/7: 发射时段提取...')
+        self.window.set_step(2, 7)
+        
+        extractor = EmissionExtractor(fs, params['target_frequencies'])
+        
+        self.window.set_status('步骤3/7: 频谱分析...')
+        self.window.set_step(3, 7)
+        
         analyzer = SpectrumAnalyzer(fs)
         if self._processed_data.ndim == 1:
-            freqs, psd = analyzer.compute_psd(self._processed_data)
-            self.window.spectrum_widget.set_data(freqs, psd, self._channel_names[:1])
+            self._freqs, self._psd = analyzer.compute_psd(self._processed_data)
+            self.window.spectrum_widget.set_data(self._freqs, self._psd, self._channel_names[:1])
         else:
-            freqs, psd = analyzer.compute_psd(self._processed_data[:, :4])
-            self.window.spectrum_widget.set_data(freqs, psd, self._channel_names[:4])
+            self._freqs, self._psd = analyzer.compute_psd(self._processed_data[:, :4])
+            self.window.spectrum_widget.set_data(self._freqs, self._psd, self._channel_names[:4])
+        
+        self.window.set_status('步骤4/7: 阻抗计算...')
+        self.window.set_step(4, 7)
+        
+        if self._processed_data.ndim == 2 and self._processed_data.shape[1] >= 4:
+            data_dict = {
+                'Ex': self._processed_data[:, 0],
+                'Ey': self._processed_data[:, 1],
+                'Hx': self._processed_data[:, 2],
+                'Hy': self._processed_data[:, 3]
+            }
+            
+            impedance_calc = ImpedanceCalculator(fs)
+            target_freqs = params['target_frequencies']
+            
+            zxy_mag_list = []
+            zxy_phase_list = []
+            zyx_mag_list = []
+            zyx_phase_list = []
+            rho_list = []
+            
+            for freq in target_freqs:
+                result = impedance_calc.compute_impedance(
+                    data_dict['Ex'], data_dict['Ey'],
+                    data_dict['Hx'], data_dict['Hy'],
+                    freq=freq,
+                    method='robust'
+                )
+                self._impedance_results[freq] = result
+                
+                zxy_mag_list.append(result.zxy_magnitude)
+                zxy_phase_list.append(result.zxy_phase)
+                zyx_mag_list.append(result.zyx_magnitude)
+                zyx_phase_list.append(result.zyx_phase)
+                
+                rho = compute_apparent_resistivity(result.zxy, freq)
+                rho_list.append(rho)
+            
+            self.window.set_status('步骤5/7: 显示结果...')
+            self.window.set_step(5, 7)
+            
+            freq_array = np.array(target_freqs)
+            zxy_mag_array = np.array(zxy_mag_list)
+            zxy_phase_array = np.array(zxy_phase_list)
+            zyx_mag_array = np.array(zyx_mag_list)
+            zyx_phase_array = np.array(zyx_phase_list)
+            rho_array = np.array(rho_list)
+            
+            self._apparent_resistivity = rho_array
+            
+            self.window.impedance_widget.set_data(
+                freq_array,
+                zxy_magnitude=zxy_mag_array,
+                zxy_phase=zxy_phase_array,
+                zyx_magnitude=zyx_mag_array,
+                zyx_phase=zyx_phase_array,
+                apparent_resistivity=rho_array
+            )
         
         self.window.set_status('处理完成')
+        self.window.set_step(7, 7)
     
     def _on_reset(self):
         """重置"""
@@ -166,6 +240,10 @@ class CSEMApplication:
         self._processed_data = None
         self._channel_names = []
         self._sample_rate = 200.0
+        self._freqs = None
+        self._psd = None
+        self._impedance_results = {}
+        self._apparent_resistivity = None
         
         self.window.time_series_widget.clear()
         self.window.spectrum_widget.clear()
